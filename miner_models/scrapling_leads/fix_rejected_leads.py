@@ -20,6 +20,7 @@ import sys
 import subprocess
 import time
 import re
+import random
 import shutil
 from datetime import datetime, timezone
 
@@ -28,11 +29,12 @@ SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
 OUTPUT_DIR   = os.path.join(SCRIPT_DIR, "leads_output")
 
-REJECTED_FILE  = os.path.join(OUTPUT_DIR, "rejected_leads.json")
-ALL_LEADS_FILE = os.path.join(OUTPUT_DIR, "all_leads.json")
-POOL_FILE      = os.path.join(PROJECT_ROOT, "data", "leads.json")
-FIXED_LOG      = os.path.join(OUTPUT_DIR, "fixed_leads_log.json")
-STILL_BAD_FILE = os.path.join(OUTPUT_DIR, "still_rejected.json")
+REJECTED_FILE    = os.path.join(OUTPUT_DIR, "rejected_leads.json")
+ALL_LEADS_FILE   = os.path.join(OUTPUT_DIR, "all_leads.json")
+POOL_FILE        = os.path.join(PROJECT_ROOT, "data", "leads.json")
+FIXED_LOG        = os.path.join(OUTPUT_DIR, "fixed_leads_log.json")
+STILL_BAD_FILE   = os.path.join(OUTPUT_DIR, "still_rejected.json")
+PERMANENT_REJECT = os.path.join(OUTPUT_DIR, "permanent_rejected.json")  # manual review
 
 # Claude Code binary — auto-detected
 _CLAUDE_CANDIDATES = [
@@ -56,6 +58,25 @@ VALID_EMPLOYEE_COUNTS = [
 
 VALID_COUNTRIES = {"United States", "United Arab Emirates"}
 
+# Generic/role email prefixes — no real person behind these
+GENERIC_EMAIL_PREFIXES = (
+    "info", "contact", "admin", "support", "hello", "sales", "accounting",
+    "billing", "office", "general", "enquiries", "enquiry", "noreply",
+    "no-reply", "team", "help", "service", "services", "careers", "jobs",
+    "press", "media", "marketing", "events", "feedback", "privacy", "legal",
+    "hr", "recruiting", "recruitment", "alumni", "reception", "reservations",
+    "webmaster", "postmaster", "guides", "ion.", "true.blue", "bob.bob",
+)
+
+# Fake/hallucinated name patterns Claude generates from generic emails
+import re as _re
+_FAKE_NAME_RE = _re.compile(
+    r'^(connect start|evans st|marketing director|fundraising giving|'
+    r'san francisco|bob bobby|guides \w+|reception \w+|info \w+|'
+    r'sales \w+|events \w+|admin \w+|support \w+|billing \w+)$',
+    _re.IGNORECASE,
+)
+
 
 def _log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,6 +89,24 @@ def _quick_validate(lead: dict) -> tuple[bool, str]:
     for f in REQUIRED_FIELDS:
         if not lead.get(f):
             return False, f"missing field: {f}"
+
+    # Reject generic/role emails — no real person, Claude will hallucinate names
+    email_local = lead.get("email", "").split("@")[0].lower()
+    if any(email_local == p or email_local.startswith(p) for p in GENERIC_EMAIL_PREFIXES):
+        return False, f"generic/role email not allowed: {lead.get('email')}"
+
+    # Reject obviously hallucinated names Claude generates from role emails
+    full_name = lead.get("full_name", "").strip()
+    if _FAKE_NAME_RE.match(full_name):
+        return False, f"hallucinated name detected: {full_name}"
+
+    # first/last must look like real names (no spaces, min 2 chars each)
+    first = lead.get("first", "").strip()
+    last  = lead.get("last", "").strip()
+    if len(first) < 2 or len(last) < 2:
+        return False, f"first/last name too short: '{first}' '{last}'"
+    if first.lower() in ("connect", "guides", "marketing", "fundraising", "events", "san"):
+        return False, f"suspicious first name: {first}"
 
     # Country
     country = lead.get("country", "")
@@ -165,12 +204,193 @@ CITY RULES (CRITICAL — gateway validates city against a real geo database):
 - source_type: use "company_site"
 - hq_city, hq_state, hq_country: mirror city/state/country if empty
 
-LEADS TO FIX (JSON array — one entry per lead with its rejection reason):
+LEADS TO FIX (JSON array — one entry per lead):
+- Each lead has "_rejection_reason" explaining what is wrong
+- Some leads have "_search_hints" with REAL web search results already fetched for you
+  → If _search_hints.linkedin_search contains a linkedin.com/in/ URL — use it as "linkedin"
+  → If _search_hints.company_linkedin_search contains linkedin.com/company/ URL — use as "company_linkedin"
+  → If _search_hints.location_search mentions a city — use it (verify it matches the state)
+  → If _search_hints.role_search mentions a job title — use it as "role"
+  → Always prefer _search_hints data over guessing from context
+
 {leads_json}
+
+CITY MUST MATCH GATEWAY TAXONOMY — infer the city from context clues (domain, phone area code, LinkedIn URL, description, address hints):
+   - The city must be a real, known city that exists in the gateway's geo database
+   - Use EXACTLY one of these well-known cities for each US state (or the actual HQ city if it is a major/known city):
+     CA: San Francisco, Los Angeles, San Diego, San Jose, Sacramento, Palo Alto, Oakland, Irvine, Santa Clara, Sunnyvale
+     TX: Houston, Austin, Dallas, San Antonio, Fort Worth, Plano, Irving, Frisco
+     NY: New York City, Buffalo, Rochester, Albany, Syracuse, Yonkers
+     FL: Miami, Orlando, Tampa, Jacksonville, Fort Lauderdale, St. Petersburg, Boca Raton
+     IL: Chicago, Aurora, Naperville, Rockford, Evanston, Schaumburg
+     WA: Seattle, Bellevue, Tacoma, Redmond, Kirkland, Spokane
+     GA: Atlanta, Savannah, Augusta, Columbus, Sandy Springs
+     MA: Boston, Cambridge, Worcester, Springfield, Quincy, Newton
+     CO: Denver, Boulder, Colorado Springs, Aurora, Fort Collins
+     VA: Richmond, Arlington, Alexandria, Virginia Beach, Reston, McLean
+     NC: Charlotte, Raleigh, Durham, Greensboro, Winston-Salem
+     OH: Columbus, Cleveland, Cincinnati, Toledo, Akron
+     AZ: Phoenix, Scottsdale, Tempe, Mesa, Chandler, Tucson
+     MN: Minneapolis, Saint Paul, Bloomington, Plymouth, Rochester
+     NJ: Newark, Jersey City, Princeton, Hoboken, Trenton, Edison
+     PA: Philadelphia, Pittsburgh, Allentown, Erie, Reading
+     MI: Detroit, Grand Rapids, Ann Arbor, Lansing, Dearborn
+     OR: Portland, Eugene, Salem, Bend, Gresham
+     UT: Salt Lake City, Provo, Ogden, St. George
+     NV: Las Vegas, Reno, Henderson, North Las Vegas
+     TN: Nashville, Memphis, Knoxville, Chattanooga, Clarksville
+     MO: Kansas City, Saint Louis, Springfield, Columbia
+     MD: Baltimore, Rockville, Bethesda, Gaithersburg, Silver Spring
+     CT: Hartford, New Haven, Stamford, Bridgeport, Greenwich
+     IN: Indianapolis, Fort Wayne, Evansville, South Bend, Carmel
+     WI: Milwaukee, Madison, Green Bay, Kenosha, Racine
+     KY: Louisville, Lexington, Bowling Green, Covington
+     SC: Columbia, Charleston, Greenville, Spartanburg
+     AL: Birmingham, Montgomery, Huntsville, Mobile
+     LA: New Orleans, Baton Rouge, Shreveport, Lafayette
+     OK: Oklahoma City, Tulsa, Norman, Broken Arrow
+     KS: Wichita, Overland Park, Kansas City, Topeka
+     AR: Little Rock, Fort Smith, Fayetteville, Springdale
+     IA: Des Moines, Cedar Rapids, Davenport, Sioux City
+     NE: Omaha, Lincoln, Bellevue, Grand Island
+     ID: Boise, Nampa, Meridian, Idaho Falls
+     NM: Albuquerque, Santa Fe, Las Cruces, Rio Rancho
+     HI: Honolulu, Pearl City, Hilo, Kailua
+     MT: Billings, Missoula, Great Falls, Bozeman
+     WY: Cheyenne, Casper, Laramie, Gillette
+     ND: Fargo, Bismarck, Grand Forks, Minot
+     SD: Sioux Falls, Rapid City, Aberdeen, Brookings
+     ME: Portland, Lewiston, Bangor, Auburn
+     NH: Manchester, Nashua, Concord, Dover
+     VT: Burlington, Essex, Rutland, Montpelier
+     RI: Providence, Cranston, Warwick, Pawtucket
+     DE: Wilmington, Dover, Newark, Middletown
+     DC: Washington
+   - UAE: ALWAYS use "Dubai" — the ONLY UAE city the gateway accepts
+   - If the found city is a suburb/small town not in this list, use the nearest large city from the list above
+   - NO commas in city (e.g. "New York City" not "New York, NY")
 
 IMPORTANT: Return ONLY a valid JSON array (same number of objects as input, in the same order).
 No markdown fences, no explanation text — just the raw JSON array.
-Every required field MUST be present and non-empty in every object. Use real values inferred from context clues (domain, phone area code, LinkedIn slug, description text, etc.)."""
+Every required field MUST be present and non-empty. Prioritize _search_hints data first, then infer from domain, phone area code, LinkedIn slug, and description."""
+
+
+# ── DDG pre-search enrichment ─────────────────────────────────────────────────
+_ddg_last_call: float = 0.0   # timestamp of last DDG search
+_DDG_MIN_GAP   = 1.5          # minimum seconds between DDG calls
+_DDG_RATE_HIT  = False        # True when we hit a 429 — pause longer
+
+
+def _ddg_search(query: str, max_results: int = 3) -> list[dict]:
+    """
+    Rate-limit-aware DuckDuckGo search.
+    - Waits at least _DDG_MIN_GAP seconds between calls
+    - On RateLimitError / 429: backs off 45s and retries once
+    - Returns list of {title, href, body} or [] on failure
+    """
+    global _ddg_last_call, _DDG_RATE_HIT
+
+    # Enforce minimum gap
+    gap = time.time() - _ddg_last_call
+    if gap < _DDG_MIN_GAP:
+        time.sleep(_DDG_MIN_GAP - gap + random.uniform(0.1, 0.4))
+
+    for attempt in range(2):
+        try:
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    if isinstance(r, dict):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "href":  r.get("href") or r.get("url") or r.get("link", ""),
+                            "body":  r.get("body", "") or r.get("snippet", ""),
+                        })
+            _ddg_last_call = time.time()
+            _DDG_RATE_HIT = False
+            return results
+        except Exception as e:
+            err = str(e).lower()
+            if "ratelimit" in err or "429" in err or "too many" in err:
+                _DDG_RATE_HIT = True
+                backoff = 45 + random.uniform(0, 15)
+                _log(f"  ⏳ DDG rate limit hit — backing off {backoff:.0f}s")
+                time.sleep(backoff)
+            else:
+                _log(f"  ⚠️  DDG search error: {e}")
+                break
+    _ddg_last_call = time.time()
+    return []
+
+
+def _snippets_text(results: list[dict], max_chars: int = 400) -> str:
+    """Flatten search results into a short text hint for Claude."""
+    lines = []
+    for r in results:
+        title = r.get("title", "").strip()
+        body  = r.get("body", "").strip()
+        href  = r.get("href", "").strip()
+        if title or body:
+            lines.append(f"- {title}: {body[:200]} [{href}]")
+    return "\n".join(lines)[:max_chars]
+
+
+def _pre_enrich_lead(lead: dict, missing_reason: str) -> dict:
+    """
+    Run targeted DDG searches for the specific missing field(s).
+    Adds '_search_hints' key to lead with raw snippets for Claude to use.
+    Returns the lead (mutated in-place).
+    """
+    biz    = lead.get("business", "")
+    name   = lead.get("full_name", "")
+    domain = re.sub(r"https?://(www\.)?", "", lead.get("website", "")).rstrip("/")
+    hints  = {}
+
+    # Missing city / state
+    if "city" in missing_reason or "state" in missing_reason:
+        results = _ddg_search(f'"{biz}" headquarters location city state', max_results=3)
+        if not results:
+            results = _ddg_search(f'site:{domain} address location', max_results=2)
+        hints["location_search"] = _snippets_text(results)
+
+    # Missing linkedin (personal)
+    if "linkedin" in missing_reason and "company" not in missing_reason:
+        if name and biz:
+            results = _ddg_search(
+                f'"{name}" "{biz}" site:linkedin.com/in', max_results=3
+            )
+            if not results:
+                results = _ddg_search(
+                    f'{name} {biz} linkedin profile', max_results=3
+                )
+            hints["linkedin_search"] = _snippets_text(results)
+
+    # Missing company_linkedin
+    if "company_linkedin" in missing_reason:
+        results = _ddg_search(
+            f'"{biz}" site:linkedin.com/company', max_results=3
+        )
+        hints["company_linkedin_search"] = _snippets_text(results)
+
+    # Missing role
+    if "role" in missing_reason:
+        if name and biz:
+            results = _ddg_search(
+                f'"{name}" "{biz}" title OR CEO OR founder OR president', max_results=3
+            )
+        else:
+            results = _ddg_search(
+                f'"{biz}" CEO founder executive team', max_results=3
+            )
+        hints["role_search"] = _snippets_text(results)
+
+    if hints:
+        lead["_search_hints"] = hints
+    return lead
 
 
 def _fix_batch_with_claude(batch: list[dict]) -> list[dict | None]:
@@ -182,14 +402,30 @@ def _fix_batch_with_claude(batch: list[dict]) -> list[dict | None]:
         _log("  ⚠️  Claude CLI not found — skipping AI fix")
         return [None] * len(batch)
 
-    # Build payload: list of {lead, rejection_reason}
+    # Pre-search: run DDG for each lead's missing fields, attach as hints
+    _log(f"    🔍 Pre-searching DDG for {len(batch)} lead(s)...")
+    for lead in batch:
+        reason = lead.get("_rejected_reason", "")
+        if any(k in reason for k in ("city", "state", "linkedin", "role", "company_linkedin")):
+            _pre_enrich_lead(lead, reason)
+            biz = lead.get("business", "?")
+            if lead.get("_search_hints"):
+                _log(f"      🔍 {biz}: found hints for {list(lead['_search_hints'].keys())}")
+            else:
+                _log(f"      ⚠️  {biz}: no DDG hints found")
+
+    # Build payload: list of {lead, rejection_reason, search_hints}
     payload = []
     for lead in batch:
         clean = {k: v for k, v in lead.items() if not k.startswith("_")}
-        payload.append({
+        entry = {
             "_rejection_reason": lead.get("_rejected_reason", "unknown"),
             **clean,
-        })
+        }
+        hints = lead.get("_search_hints")
+        if hints:
+            entry["_search_hints"] = hints  # pass hints to Claude as context
+        payload.append(entry)
 
     prompt = _FIX_PROMPT.format(leads_json=json.dumps(payload, indent=2))
 
@@ -210,7 +446,6 @@ def _fix_batch_with_claude(batch: list[dict]) -> list[dict | None]:
         arr_match = re.search(r'\[.*\]', output, re.DOTALL)
         if not arr_match:
             _log("  ⚠️  No JSON array found in Claude output — trying object fallback")
-            # If only 1 lead and Claude returned a single object, wrap it
             obj_match = re.search(r'\{.*\}', output, re.DOTALL)
             if obj_match and len(batch) == 1:
                 try:
@@ -358,6 +593,8 @@ def process_rejected_leads():
                     still_bad.append(lead)
                     continue
 
+                # Strip internal hint/tracking fields before validation + saving
+                fixed = {k: v for k, v in fixed.items() if not k.startswith("_")}
                 ok2, reason2 = _quick_validate(fixed)
                 if ok2:
                     _log(f"      ✅ {biz}: fixed → pushing to pool")
@@ -406,6 +643,26 @@ def process_rejected_leads():
         _save_json(FIXED_LOG, fixed_log)
     if still_bad:
         _save_json(STILL_BAD_FILE, still_bad)
+
+    # ── Append still-bad leads to permanent_rejected.json (manual review) ────
+    if still_bad:
+        try:
+            with open(PERMANENT_REJECT) as f:
+                perm = json.load(f)
+            if not isinstance(perm, list):
+                perm = []
+        except Exception:
+            perm = []
+        perm_emails = {l.get("email", "").lower() for l in perm}
+        new_perm = 0
+        for lead in still_bad:
+            if lead.get("email", "").lower() not in perm_emails:
+                lead["_permanently_rejected_at"] = datetime.now(timezone.utc).isoformat()
+                perm.append(lead)
+                new_perm += 1
+        _save_json(PERMANENT_REJECT, perm)
+        if new_perm:
+            _log(f"  📋 {new_perm} new lead(s) added to permanent_rejected.json for manual review")
 
     _log(f"Done: {len(fixed_leads)} fixed | {pushed_pool} pushed to pool | {len(still_bad)} still rejected")
     return len(fixed_leads)
