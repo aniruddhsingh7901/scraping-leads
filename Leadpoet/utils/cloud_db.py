@@ -2121,7 +2121,7 @@ def gateway_verify_submission(wallet: bt.wallet, lead_id: str) -> Dict:
         
         # Request verification
         response = requests.post(
-            f"{GATEWAY_URL}/submit",
+            f"{GATEWAY_URL}/submit/",
             json=event,
             timeout=300  # 5 minutes timeout (allows for international network latency + gateway verification steps: S3, MinIO, DB, TEE)
         )

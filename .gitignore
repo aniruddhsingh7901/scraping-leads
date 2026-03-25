@@ -1,5 +1,12 @@
 # Project-specific
 bittensor
+
+# Scrapling library (installed locally from source)
+Scrapling/
+
+# Runtime output / lead data files
+miner_models/scrapling_leads/leads_output/
+attestation.json
 .replit
 replit.md
 .cursor/

@@ -8,7 +8,12 @@ import bittensor as bt
 import socket
 from Leadpoet.base.miner import BaseMinerNeuron
 from Leadpoet.protocol import LeadRequest
-from miner_models.lead_sorcerer_main.main_leads import get_leads
+try:
+    from miner_models.lead_sorcerer_main.main_leads import get_leads as _sorcerer_get_leads
+    _SORCERER_IMPORTED = True
+except Exception:
+    _sorcerer_get_leads = None
+    _SORCERER_IMPORTED = False
 from typing import Tuple, List, Dict, Optional
 from aiohttp import web
 import os
@@ -17,6 +22,40 @@ import html
 from datetime import datetime, timezone
 import json
 from Leadpoet.base.utils.pool import get_leads_from_pool
+
+
+# ── Smart get_leads: use lead_sorcerer when API keys present, else pool ───────
+_SORCERER_REQUIRED_KEYS = ['GSE_API_KEY', 'GSE_CX', 'OPENROUTER_KEY', 'FIRECRAWL_KEY']
+
+
+async def get_leads(num_leads: int, industry=None, region=None):
+    """
+    Route lead sourcing:
+      - If lead_sorcerer API keys are set → use lead_sorcerer (full enrichment)
+      - Otherwise → serve from local pool data/leads.json (no extra keys needed)
+    The pool leads already contain source_url + source_type, so they pass
+    process_generated_leads() without further validation.
+    """
+    if _SORCERER_IMPORTED and all(os.environ.get(k) for k in _SORCERER_REQUIRED_KEYS):
+        try:
+            return await _sorcerer_get_leads(num_leads, industry=industry, region=region)
+        except Exception as _err:
+            bt.logging.warning(f"lead_sorcerer failed ({_err}), falling back to pool")
+
+    # Fallback: serve from local pool (synchronous call, run in executor)
+    loop = asyncio.get_event_loop()
+    leads = await loop.run_in_executor(
+        None,
+        lambda: get_leads_from_pool(max(num_leads or 1, 10),
+                                     industry=industry,
+                                     region=region) or []
+    )
+    if leads:
+        bt.logging.info(f"✅ Served {len(leads)} leads from local pool (data/leads.json)")
+    else:
+        bt.logging.warning("⚠️ Local pool is empty — no leads to serve")
+    return leads
+
 
 from miner_models.intent_model import (
     rank_leads,
@@ -214,6 +253,10 @@ class Miner(BaseMinerNeuron):
                     submitted_count = 0
                     verified_count = 0
                     duplicate_count = 0
+                    # Anti-spam: gateway enforces ~20s cooldown between presign requests.
+                    # Track when we last called presign so we can wait the remainder.
+                    _PRESIGN_COOLDOWN_SECS = 21
+                    _last_presign_ts = 0.0
                     
                     for lead in sanitized:
                         business_name = lead.get('business', 'Unknown')
@@ -236,10 +279,26 @@ class Miner(BaseMinerNeuron):
                                 print(f"⏭️  Skipping duplicate person+company: {business_name}")
                                 print(f"      LinkedIn: {linkedin_url[:50]}...")
                                 print(f"      Company: {company_linkedin_url[:50]}...")
-                            duplicate_count += 1
+                                duplicate_count += 1
+                                continue
+                        
+                        # Pre-flight: skip leads with descriptions that are too short
+                        # (Gateway requires >= 70 chars; failing wastes a submission slot)
+                        description = lead.get('description', '').strip()
+                        if len(description) < 70:
+                            print(f"⏭️  Skipping {business_name}: description too short ({len(description)} chars, need 70+)")
                             continue
                         
+                        # Respect gateway anti-spam cooldown between presign requests
+                        if _last_presign_ts > 0:
+                            elapsed = time.time() - _last_presign_ts
+                            if elapsed < _PRESIGN_COOLDOWN_SECS:
+                                wait_secs = _PRESIGN_COOLDOWN_SECS - elapsed
+                                print(f"⏳ Waiting {wait_secs:.0f}s for gateway anti-spam cooldown...")
+                                await asyncio.sleep(wait_secs)
+                        
                         # Step 1: Get presigned URLs (gateway logs SUBMISSION_REQUEST with committed hash)
+                        _last_presign_ts = time.time()
                         presign_result = gateway_get_presigned_url(self.wallet, lead)
                         if not presign_result:
                             print(f"⚠️  Failed to get presigned URL for {business_name}")
@@ -1870,7 +1929,14 @@ def sanitize_prospect(prospect, miner_hotkey=None):
         "socials":
         prospect.get("socials", {}),
         "source":
-        miner_hotkey  # Add source field
+        miner_hotkey,  # Add source field
+        # HQ location fields required by gateway (hq_country is mandatory)
+        "hq_country":
+        strip_html(prospect.get("hq_country") or prospect.get("country", "")),
+        "hq_state":
+        strip_html(prospect.get("hq_state") or prospect.get("state", "")),
+        "hq_city":
+        strip_html(prospect.get("hq_city") or prospect.get("city", "")),
     }
 
     if not valid_url(sanitized["linkedin"]):
